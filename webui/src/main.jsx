@@ -76,6 +76,12 @@ const starterHtml = `<!doctype html>
 </body>
 </html>`;
 
+function stripFenceClient(output) {
+  const trimmed = output.trim();
+  const match = trimmed.match(/^```(?:html)?\s*([\s\S]*?)\s*```$/i);
+  return match ? match[1].trim() : trimmed;
+}
+
 function getStoredSettings() {
   try {
     return JSON.parse(localStorage.getItem("huashu-webui-settings") || "{}");
@@ -108,6 +114,9 @@ function App() {
   const [error, setError] = useState("");
   const [context, setContext] = useState(null);
   const [ollamaModels, setOllamaModels] = useState([]);
+  const [streamChars, setStreamChars] = useState(0);
+  const [streamElapsed, setStreamElapsed] = useState(0);
+  const [streamStatus, setStreamStatus] = useState("");
 
   useEffect(() => {
     fetch("/api/context")
@@ -141,20 +150,86 @@ function App() {
   async function generate() {
     setBusy(true);
     setError("");
+    setStreamChars(0);
+    setStreamElapsed(0);
+    setStreamStatus("Connecting...");
+    setTab("preview");
+
+    const startedAt = Date.now();
+    const tickInterval = setInterval(() => {
+      setStreamElapsed(Math.round((Date.now() - startedAt) / 1000));
+    }, 250);
+
     try {
       const response = await fetch("/api/generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ provider, baseUrl, model, apiKey, mode, prompt }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Generation failed");
-      setHtml(data.html);
-      setTab("preview");
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok || !contentType.includes("event-stream")) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.error || `Generation failed (${response.status})`);
+      }
+
+      setStreamStatus("Streaming...");
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let acc = "";
+      let lastFlush = 0;
+      let streamError = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const events = buffer.split("\n\n");
+        buffer = events.pop() || "";
+        for (const ev of events) {
+          let eventName = "message";
+          let dataStr = "";
+          for (const line of ev.split("\n")) {
+            if (line.startsWith("event:")) eventName = line.slice(6).trim();
+            else if (line.startsWith("data:")) dataStr += line.slice(5).trim();
+          }
+          if (!dataStr) continue;
+          let payload;
+          try {
+            payload = JSON.parse(dataStr);
+          } catch {
+            continue;
+          }
+          if (eventName === "error") {
+            streamError = payload.error || "Generation failed";
+            break;
+          }
+          if (eventName === "delta" && payload.text) {
+            acc += payload.text;
+            const now = Date.now();
+            if (now - lastFlush > 250) {
+              setHtml(stripFenceClient(acc));
+              setStreamChars(acc.length);
+              lastFlush = now;
+            }
+          }
+        }
+        if (streamError) break;
+      }
+
+      if (streamError) throw new Error(streamError);
+
+      setHtml(stripFenceClient(acc));
+      setStreamChars(acc.length);
+      setStreamStatus("");
       setStep("ship");
     } catch (err) {
       setError(err.message);
+      setStreamStatus("");
     } finally {
+      clearInterval(tickInterval);
       setBusy(false);
     }
   }
@@ -350,7 +425,21 @@ function App() {
         </header>
 
         <section className="canvas">
-          {tab === "preview" ? <iframe title="Generated preview" srcDoc={html} sandbox="allow-scripts" /> : null}
+          {tab === "preview" ? (
+            <div className="preview-wrap">
+              <iframe title="Generated preview" srcDoc={html} sandbox="allow-scripts" />
+              {busy ? (
+                <div className="stream-overlay" role="status" aria-live="polite">
+                  <div className="stream-pulse" />
+                  <strong>{streamStatus || "Generating"}</strong>
+                  <span>
+                    {streamElapsed}s elapsed · {streamChars.toLocaleString()} chars streamed
+                  </span>
+                  <small>The preview updates as the model writes the page.</small>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
           {tab === "code" ? <textarea className="code-editor" value={html} onChange={(event) => setHtml(event.target.value)} /> : null}
           {tab === "demos" ? (
             <div className="demo-grid">

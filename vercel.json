@@ -1,0 +1,10 @@
+{
+  "installCommand": "cd webui && npm install",
+  "buildCommand": "cd webui && npm run build",
+  "outputDirectory": "webui/dist",
+  "functions": {
+    "api/*.js": {
+      "includeFiles": "{SKILL.md,references/**,demos/**,assets/showcases/**}"
+    }
+  }
+}

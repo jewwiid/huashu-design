@@ -19,7 +19,7 @@ async function listHtml(dir) {
 }
 
 async function buildContext(mode) {
-  const [skill, workflow, styles, verification, animations, slides, demos] =
+  const [skill, workflow, styles, verification, animations, slides, landing, demos] =
     await Promise.all([
       readText("SKILL.md", 12000),
       readText("references/workflow.md", 7000),
@@ -27,6 +27,7 @@ async function buildContext(mode) {
       readText("references/verification.md", 5000),
       mode === "motion" ? readText("references/animations.md", 7000) : "",
       mode === "slides" ? readText("references/slide-decks.md", 7000) : "",
+      mode === "prototype" ? readText("references/landing-pages.md", 7000) : "",
       listHtml("demos"),
     ]);
 
@@ -34,6 +35,7 @@ async function buildContext(mode) {
     "You are Huashu Design Studio, an HTML-native design agent.",
     "Generate complete, self-contained HTML. Inline CSS and JavaScript are preferred.",
     "Avoid generic AI design defaults: purple gradients, emoji-as-icons, decorative blobs, and fake product silhouettes.",
+    "For prototypes the user calls a 'website' or 'landing page', follow the Landing Page Track: pick sections by business type, use real-feeling copy, and run the anti-slop checklist before delivery.",
     "Do not include markdown fences unless the user specifically asks for markdown.",
     "",
     "Available demo files:",
@@ -50,13 +52,33 @@ async function buildContext(mode) {
     "",
     mode === "motion" ? `Animation excerpt:\n${animations}` : "",
     mode === "slides" ? `Slide excerpt:\n${slides}` : "",
+    mode === "prototype" ? `Landing page track:\n${landing}` : "",
     "",
     "Verification excerpt:",
     verification,
   ].join("\n");
 }
 
-async function callOpenAICompatible({ baseUrl, apiKey, model, system, prompt }) {
+function resolveApiKey(provider, supplied) {
+  if (supplied) return supplied;
+  if (provider === "openai") return process.env.OPENAI_API_KEY || "";
+  if (provider === "anthropic") return process.env.ANTHROPIC_API_KEY || "";
+  if (provider === "ollama-cloud") return process.env.OLLAMA_API_KEY || "";
+  return "";
+}
+
+function providerRequiresKey(provider) {
+  return provider === "openai" || provider === "anthropic" || provider === "ollama-cloud";
+}
+
+function envVarNameFor(provider) {
+  if (provider === "openai") return "OPENAI_API_KEY";
+  if (provider === "anthropic") return "ANTHROPIC_API_KEY";
+  if (provider === "ollama-cloud") return "OLLAMA_API_KEY";
+  return "";
+}
+
+async function streamOpenAICompatible({ baseUrl, apiKey, model, system, prompt, onDelta }) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
@@ -66,6 +88,7 @@ async function callOpenAICompatible({ baseUrl, apiKey, model, system, prompt }) 
     body: JSON.stringify({
       model,
       temperature: 0.7,
+      stream: true,
       messages: [
         { role: "system", content: system },
         { role: "user", content: prompt },
@@ -73,13 +96,38 @@ async function callOpenAICompatible({ baseUrl, apiKey, model, system, prompt }) 
     }),
   });
 
-  const text = await response.text();
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
-  const json = JSON.parse(text);
-  return json.choices?.[0]?.message?.content || "";
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const json = JSON.parse(payload);
+        const delta = json.choices?.[0]?.delta?.content;
+        if (delta) onDelta(delta);
+      } catch {
+        // tolerate malformed chunk
+      }
+    }
+  }
 }
 
-async function callAnthropic({ baseUrl, apiKey, model, system, prompt }) {
+async function streamAnthropic({ baseUrl, apiKey, model, system, prompt, onDelta }) {
   if (!apiKey) throw new Error("Anthropic requires an API key.");
   const response = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/messages`, {
     method: "POST",
@@ -92,15 +140,42 @@ async function callAnthropic({ baseUrl, apiKey, model, system, prompt }) {
       model,
       max_tokens: 8000,
       temperature: 0.7,
+      stream: true,
       system,
       messages: [{ role: "user", content: prompt }],
     }),
   });
 
-  const text = await response.text();
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
-  const json = JSON.parse(text);
-  return json.content?.map((part) => part.text || "").join("") || "";
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+    for (const ev of events) {
+      const dataLine = ev.split("\n").find((line) => line.startsWith("data:"));
+      if (!dataLine) continue;
+      const payload = dataLine.slice(5).trim();
+      if (!payload) continue;
+      try {
+        const json = JSON.parse(payload);
+        if (json.type === "content_block_delta" && json.delta?.type === "text_delta") {
+          onDelta(json.delta.text);
+        }
+      } catch {
+        // tolerate malformed chunk
+      }
+    }
+  }
 }
 
 function stripFence(output) {
@@ -112,40 +187,75 @@ function stripFence(output) {
 module.exports = async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
-  try {
-    const body = req.body || {};
-    const provider = body.provider || "ollama";
-    const baseUrl =
-      body.baseUrl ||
-      (provider === "anthropic"
-        ? "https://api.anthropic.com"
-        : provider === "ollama"
-          ? "http://localhost:11434/v1"
-          : provider === "ollama-cloud"
-            ? "https://ollama.com/v1"
+  const provider = (req.body && req.body.provider) || "ollama";
+  const body = req.body || {};
+  const baseUrl =
+    body.baseUrl ||
+    (provider === "anthropic"
+      ? "https://api.anthropic.com"
+      : provider === "ollama"
+        ? "http://localhost:11434/v1"
+        : provider === "ollama-cloud"
+          ? "https://ollama.com/v1"
           : "https://api.openai.com/v1");
-    const model =
-      body.model ||
-      (provider === "anthropic"
-        ? "claude-sonnet-4-6"
-        : provider === "ollama"
-          ? "kimi-k2.6:cloud"
-          : provider === "ollama-cloud"
-            ? "kimi-k2.6"
-            : "gpt-5.4");
-    const mode = body.mode || "prototype";
-    const prompt = String(body.prompt || "").trim();
-    if (!prompt) throw new Error("Prompt is required.");
+  const model =
+    body.model ||
+    (provider === "anthropic"
+      ? "claude-sonnet-4-6"
+      : provider === "ollama"
+        ? "kimi-k2.6:cloud"
+        : provider === "ollama-cloud"
+          ? "kimi-k2.6"
+          : "gpt-5.4");
+  const mode = body.mode || "prototype";
+  const prompt = String(body.prompt || "").trim();
+  const apiKey = resolveApiKey(provider, body.apiKey);
 
+  if (!prompt) {
+    return res.status(400).json({ error: "Prompt is required." });
+  }
+  if (providerRequiresKey(provider) && !apiKey) {
+    const envName = envVarNameFor(provider);
+    return res.status(400).json({
+      error: `${provider} requires an API key. Enter one in the API key field, or set ${envName} in the deployment's environment variables.`,
+    });
+  }
+
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const writeEvent = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  try {
     const system = await buildContext(mode);
     const fullPrompt = [`Mode: ${mode}`, "Return a complete HTML document.", "", prompt].join("\n");
-    const generated =
-      provider === "anthropic"
-        ? await callAnthropic({ baseUrl, apiKey: body.apiKey, model, system, prompt: fullPrompt })
-        : await callOpenAICompatible({ baseUrl, apiKey: body.apiKey, model, system, prompt: fullPrompt });
 
-    res.status(200).json({ html: stripFence(generated), model, provider });
+    writeEvent("start", { provider, model });
+
+    const stream = provider === "anthropic" ? streamAnthropic : streamOpenAICompatible;
+    await stream({
+      baseUrl,
+      apiKey,
+      model,
+      system,
+      prompt: fullPrompt,
+      onDelta: (delta) => writeEvent("delta", { text: delta }),
+    });
+
+    writeEvent("done", { provider, model });
+    res.end();
   } catch (error) {
-    res.status(500).json({ error: error.message || "Unexpected server error" });
+    let message = error.message || "Unexpected server error";
+    if (/^401\b/.test(message)) {
+      const envName = envVarNameFor(provider) || "the provider's API key";
+      message = `Provider rejected the API key (401). Double-check the key for ${provider}, or update ${envName} in the deployment's environment variables.`;
+    }
+    writeEvent("error", { error: message });
+    res.end();
   }
 };

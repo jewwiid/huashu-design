@@ -52,7 +52,7 @@ async function listHtml(dir) {
 }
 
 async function buildContext(mode) {
-  const [skill, workflow, styles, verification, animations, slides, demos] =
+  const [skill, workflow, styles, verification, animations, slides, landing, demos] =
     await Promise.all([
       readText("SKILL.md", 12000),
       readText("references/workflow.md", 7000),
@@ -60,6 +60,7 @@ async function buildContext(mode) {
       readText("references/verification.md", 5000),
       mode === "motion" ? readText("references/animations.md", 7000) : "",
       mode === "slides" ? readText("references/slide-decks.md", 7000) : "",
+      mode === "prototype" ? readText("references/landing-pages.md", 7000) : "",
       listHtml("demos"),
     ]);
 
@@ -69,7 +70,7 @@ async function buildContext(mode) {
     "Generate complete, self-contained HTML. Inline CSS and JavaScript are preferred.",
     "Use high-quality layout, restrained interface density, real typography decisions, and clear hierarchy.",
     "Avoid generic AI design defaults: purple gradients, emoji-as-icons, decorative blobs, and fake product silhouettes.",
-    "For clickable prototypes, make the interactions work in the HTML.",
+    "For prototypes the user calls a 'website' or 'landing page', follow the Landing Page Track: pick sections by business type, use real-feeling copy, and run the anti-slop checklist before delivery.",
     "For slide decks, use 16:9 stage sizing and keyboard navigation if relevant.",
     "For animations, expose a duration comment and keep the first frame renderable.",
     "Do not include markdown fences unless the user specifically asks for markdown.",
@@ -88,6 +89,7 @@ async function buildContext(mode) {
     "",
     mode === "motion" ? `Animation excerpt:\n${animations}` : "",
     mode === "slides" ? `Slide excerpt:\n${slides}` : "",
+    mode === "prototype" ? `Landing page track:\n${landing}` : "",
     "",
     "Verification excerpt:",
     verification,
@@ -107,6 +109,25 @@ function providerDefaults(provider) {
   return { baseUrl: "https://api.openai.com/v1", model: "gpt-5.4" };
 }
 
+function resolveApiKey(provider, supplied) {
+  if (supplied) return supplied;
+  if (provider === "openai") return process.env.OPENAI_API_KEY || "";
+  if (provider === "anthropic") return process.env.ANTHROPIC_API_KEY || "";
+  if (provider === "ollama-cloud") return process.env.OLLAMA_API_KEY || "";
+  return "";
+}
+
+function providerRequiresKey(provider) {
+  return provider === "openai" || provider === "anthropic" || provider === "ollama-cloud";
+}
+
+function envVarNameFor(provider) {
+  if (provider === "openai") return "OPENAI_API_KEY";
+  if (provider === "anthropic") return "ANTHROPIC_API_KEY";
+  if (provider === "ollama-cloud") return "OLLAMA_API_KEY";
+  return "";
+}
+
 async function getLocalOllamaModels() {
   try {
     const response = await fetch("http://localhost:11434/api/tags", {
@@ -120,17 +141,17 @@ async function getLocalOllamaModels() {
   }
 }
 
-async function callOpenAICompatible({ baseUrl, apiKey, model, system, prompt }) {
-  const url = `${baseUrl.replace(/\/$/, "")}/chat/completions`;
+async function streamOpenAICompatible({ baseUrl, apiKey, model, system, prompt, onDelta }) {
   const headers = { "Content-Type": "application/json" };
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-  const response = await fetch(url, {
+  const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers,
     body: JSON.stringify({
       model,
       temperature: 0.7,
+      stream: true,
       messages: [
         { role: "system", content: system },
         { role: "user", content: prompt },
@@ -138,16 +159,38 @@ async function callOpenAICompatible({ baseUrl, apiKey, model, system, prompt }) 
     }),
   });
 
-  const text = await response.text();
   if (!response.ok) {
+    const text = await response.text();
     throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
   }
 
-  const json = JSON.parse(text);
-  return json.choices?.[0]?.message?.content || "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const payload = trimmed.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      try {
+        const json = JSON.parse(payload);
+        const delta = json.choices?.[0]?.delta?.content;
+        if (delta) onDelta(delta);
+      } catch {
+        // tolerate malformed chunk
+      }
+    }
+  }
 }
 
-async function callAnthropic({ baseUrl, apiKey, model, system, prompt }) {
+async function streamAnthropic({ baseUrl, apiKey, model, system, prompt, onDelta }) {
   if (!apiKey) throw new Error("Anthropic requires an API key.");
 
   const response = await fetch(`${baseUrl.replace(/\/$/, "")}/v1/messages`, {
@@ -161,18 +204,42 @@ async function callAnthropic({ baseUrl, apiKey, model, system, prompt }) {
       model,
       max_tokens: 8000,
       temperature: 0.7,
+      stream: true,
       system,
       messages: [{ role: "user", content: prompt }],
     }),
   });
 
-  const text = await response.text();
   if (!response.ok) {
+    const text = await response.text();
     throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 600)}`);
   }
 
-  const json = JSON.parse(text);
-  return json.content?.map((part) => part.text || "").join("") || "";
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split("\n\n");
+    buffer = events.pop() || "";
+    for (const ev of events) {
+      const dataLine = ev.split("\n").find((line) => line.startsWith("data:"));
+      if (!dataLine) continue;
+      const payload = dataLine.slice(5).trim();
+      if (!payload) continue;
+      try {
+        const json = JSON.parse(payload);
+        if (json.type === "content_block_delta" && json.delta?.type === "text_delta") {
+          onDelta(json.delta.text);
+        }
+      } catch {
+        // tolerate malformed chunk
+      }
+    }
+  }
 }
 
 function stripFence(output) {
@@ -236,24 +303,43 @@ app.get("/api/ollama-models", async (_req, res) => {
   res.json({ models: await getLocalOllamaModels() });
 });
 
-app.post("/api/generate", async (req, res, next) => {
-  try {
-    const body = req.body || {};
-    const provider = body.provider || "ollama";
-    const defaults = providerDefaults(provider);
-    const baseUrl = body.baseUrl || defaults.baseUrl;
-    let model = body.model || defaults.model;
-    const prompt = String(body.prompt || "").trim();
-    const mode = body.mode || "prototype";
+app.post("/api/generate", async (req, res) => {
+  const provider = (req.body && req.body.provider) || "ollama";
+  const body = req.body || {};
+  const defaults = providerDefaults(provider);
+  const baseUrl = body.baseUrl || defaults.baseUrl;
+  let model = body.model || defaults.model;
+  const prompt = String(body.prompt || "").trim();
+  const mode = body.mode || "prototype";
+  const apiKey = resolveApiKey(provider, body.apiKey);
 
-    if (!prompt) throw new Error("Prompt is required.");
-    if (provider === "ollama") {
-      const localModels = await getLocalOllamaModels();
-      if (localModels.length && !localModels.includes(model)) {
-        model = localModels[0];
-      }
+  if (!prompt) {
+    return res.status(400).json({ error: "Prompt is required." });
+  }
+  if (providerRequiresKey(provider) && !apiKey) {
+    const envName = envVarNameFor(provider);
+    return res.status(400).json({
+      error: `${provider} requires an API key. Enter one in the API key field or set ${envName} in webui/.env.local (or the repo root .env.local).`,
+    });
+  }
+  if (provider === "ollama") {
+    const localModels = await getLocalOllamaModels();
+    if (localModels.length && !localModels.includes(model)) {
+      model = localModels[0];
     }
+  }
 
+  res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  if (typeof res.flushHeaders === "function") res.flushHeaders();
+
+  const writeEvent = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
+  try {
     const system = await buildContext(mode);
     const fullPrompt = [
       `Mode: ${mode}`,
@@ -263,14 +349,28 @@ app.post("/api/generate", async (req, res, next) => {
       prompt,
     ].join("\n");
 
-    const generated =
-      provider === "anthropic"
-        ? await callAnthropic({ baseUrl, apiKey: body.apiKey, model, system, prompt: fullPrompt })
-        : await callOpenAICompatible({ baseUrl, apiKey: body.apiKey, model, system, prompt: fullPrompt });
+    writeEvent("start", { provider, model });
 
-    res.json({ html: stripFence(generated), model, provider });
+    const stream = provider === "anthropic" ? streamAnthropic : streamOpenAICompatible;
+    await stream({
+      baseUrl,
+      apiKey,
+      model,
+      system,
+      prompt: fullPrompt,
+      onDelta: (delta) => writeEvent("delta", { text: delta }),
+    });
+
+    writeEvent("done", { provider, model });
+    res.end();
   } catch (error) {
-    next(error);
+    let message = error.message || "Unexpected server error";
+    if (/^401\b/.test(message)) {
+      const envName = envVarNameFor(provider) || "the provider's API key";
+      message = `Provider rejected the API key (401). Double-check the key for ${provider}, or update ${envName} in .env.local.`;
+    }
+    writeEvent("error", { error: message });
+    res.end();
   }
 });
 

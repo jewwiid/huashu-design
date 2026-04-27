@@ -23,3 +23,5 @@ demos/_verify.mjs
 .vercel
 
 .env.local
+
+.claude/

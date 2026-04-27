@@ -89,9 +89,11 @@ function App() {
   if (shareMatch) return <ClientMockup shareId={shareMatch[1]} />;
 
   const stored = useMemo(getStoredSettings, []);
-  const [provider, setProvider] = useState(stored.provider || "ollama");
-  const [baseUrl, setBaseUrl] = useState(stored.baseUrl || providerPresets.ollama.baseUrl);
-  const [model, setModel] = useState(stored.model || providerPresets.ollama.model);
+  const providerFromStorage = stored.provider === "ollama" && window.location.hostname !== "localhost" ? "ollama-cloud" : stored.provider;
+  const initialProvider = providerFromStorage || "ollama-cloud";
+  const [provider, setProvider] = useState(initialProvider);
+  const [baseUrl, setBaseUrl] = useState(stored.baseUrl || providerPresets[initialProvider].baseUrl);
+  const [model, setModel] = useState(stored.model || providerPresets[initialProvider].model);
   const [apiKey, setApiKey] = useState("");
   const [mode, setMode] = useState(stored.mode || "prototype");
   const [prompt, setPrompt] = useState(
@@ -147,13 +149,17 @@ function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ provider, baseUrl, model, apiKey, mode, prompt }),
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Generation failed");
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `Generation failed with ${response.status}`);
       setHtml(data.html);
       setTab("preview");
       setStep("ship");
     } catch (err) {
-      setError(err.message);
+      setError(
+        err.message === "Failed to fetch"
+          ? "The browser could not reach the generation API. Refresh and try again, or switch to Ollama Cloud/OpenAI if you are on the hosted Vercel app."
+          : err.message
+      );
     } finally {
       setBusy(false);
     }
